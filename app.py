@@ -87,6 +87,19 @@ def metric_card(label: str, value: str, delta: str | None = None):
     )
 
 
+def safe_table(rows_slice: list, columns: list[str]) -> pd.DataFrame:
+    width = len(columns)
+    normalized_rows = []
+    for row in rows_slice:
+        row = list(row) if isinstance(row, (list, tuple)) else [row]
+        if len(row) < width:
+            row = row + [None] * (width - len(row))
+        else:
+            row = row[:width]
+        normalized_rows.append(row)
+    return pd.DataFrame(normalized_rows, columns=columns).dropna(how="all")
+
+
 @st.cache_data(show_spinner=False)
 def load_excel_data(file_bytes: bytes | None) -> dict:
     source = io.BytesIO(file_bytes) if file_bytes else DEFAULT_EXCEL_PATH
@@ -98,10 +111,8 @@ def load_excel_data(file_bytes: bytes | None) -> dict:
         df = clean_df(df)
         data[key] = df
 
-    # Dashboard sheet (raw layout for trust / audit)
     data["dashboard_raw"] = clean_df(pd.read_excel(xls, sheet_name="Dashboard Ejecutivo", header=None))
 
-    # Report/info sheets in raw mode
     for sheet_name in ["Radar Cliente", "Informe Cliente", "Informe Inversor", "Reporte por Módulo", "Reporte Completo", "Gráficos y Reportes"]:
         data[sheet_name] = clean_df(pd.read_excel(xls, sheet_name=sheet_name, header=None))
 
@@ -114,13 +125,12 @@ def load_excel_data(file_bytes: bytes | None) -> dict:
         title = rows[0][0] if rows and rows[0] and rows[0][0] else sheet_name
         module_names[sheet_name] = str(title)
 
-        # KPI table at rows 5:10 (0-index 4:10)
-        kpi = pd.DataFrame(rows[4:10], columns=["Indicador", "Valor", "Fuente", "Comentario"]).dropna(how="all")
-        kpi = kpi[kpi["Indicador"].notna()]
+        kpi = safe_table(rows[4:10], ["Indicador", "Valor", "Fuente", "Comentario"])
+        kpi = kpi[kpi["Indicador"].notna()] if not kpi.empty else kpi
 
-        # Activation table at rows 13: (0-index 12:)
-        activation = pd.DataFrame(rows[12:], columns=["Cliente", "Activado", "Semáforo", "Acciones", "Problemas", "Ahorro"]).dropna(how="all")
-        activation = activation[activation["Cliente"].notna()]
+        activation = safe_table(rows[12:], ["Cliente", "Activado", "Semáforo", "Acciones", "Problemas", "Ahorro"])
+        activation = activation[activation["Cliente"].notna()] if not activation.empty else activation
+
         module_tables[sheet_name] = {
             "title": title,
             "kpi": kpi,
@@ -226,7 +236,6 @@ if selected_clients:
     module_long = module_long[module_long["Cliente"].astype(str).isin(selected_clients)]
 
 
-# ---------- PÁGINAS ----------
 if page == "Resumen ejecutivo":
     total_clientes = len(base)
     activos = int((base["Estado proyecto"].astype(str) == "Activo").sum()) if not base.empty else 0
@@ -236,7 +245,6 @@ if page == "Resumen ejecutivo":
     ahorro_total = pd.to_numeric(acciones["Ahorro anual esperado (€)"], errors="coerce").sum()
     inversion_total = pd.to_numeric(acciones["Coste implementación (€)"], errors="coerce").sum()
     roi_prom = pd.to_numeric(finanzas["ROI cartera (%)"], errors="coerce").mean() / 100 if not finanzas.empty else np.nan
-    criticas = int((acciones["Categoría"].astype(str) == "Acción crítica").sum()) if not acciones.empty else 0
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -254,14 +262,7 @@ if page == "Resumen ejecutivo":
     with left:
         ranking = finanzas[["Cliente", "EBITDA actual (€)", "Mejora EBITDA (€)", "Payback period (meses)"]].copy()
         ranking = ranking.sort_values("Mejora EBITDA (€)", ascending=False)
-        fig = px.bar(
-            ranking,
-            x="Cliente",
-            y="Mejora EBITDA (€)",
-            color="Payback period (meses)",
-            title="Impacto EBITDA por cliente",
-            text_auto=".2s",
-        )
+        fig = px.bar(ranking, x="Cliente", y="Mejora EBITDA (€)", color="Payback period (meses)", title="Impacto EBITDA por cliente", text_auto=".2s")
         fig.update_layout(height=420)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -284,16 +285,8 @@ if page == "Resumen ejecutivo":
         fig.update_layout(height=360)
         st.plotly_chart(fig, use_container_width=True)
 
+    pipeline_cols = ["Marca/Nombre comercial", "País", "Sector", "Facturación anual (€)", "EBITDA (€)", "Estado proyecto", "Módulos contratados"]
     st.subheader("Pipeline operativo")
-    pipeline_cols = [
-        "Marca/Nombre comercial",
-        "País",
-        "Sector",
-        "Facturación anual (€)",
-        "EBITDA (€)",
-        "Estado proyecto",
-        "Módulos contratados",
-    ]
     st.dataframe(base[pipeline_cols], use_container_width=True, hide_index=True)
 
 elif page == "Clientes":
@@ -318,92 +311,19 @@ elif page == "Clientes":
     client_df = client_df.sort_values(sort_col, ascending=False)
 
     st.dataframe(client_df, use_container_width=True, hide_index=True)
-    st.download_button(
-        "Descargar tabla clientes CSV",
-        client_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="clientes_filtrados.csv",
-        mime="text/csv",
-    )
-
-    if not client_df.empty:
-        client_name = client_df.iloc[0]["Marca/Nombre comercial"]
-        st.subheader(f"Ficha rápida — {client_name}")
-        row = client_df.iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Facturación", fmt_money(row["Facturación anual (€)"]))
-        c2.metric("EBITDA", fmt_money(row["EBITDA (€)"]))
-        c3.metric("Empleados", f"{int(row['Número empleados'])}" if pd.notna(row["Número empleados"]) else "—")
-        c4.metric("Estado", row["Estado proyecto"])
-
-        left, right = st.columns((1.1, 1))
-        with left:
-            st.markdown("**Perfil**")
-            st.write(f"**Nombre legal:** {row['Nombre legal']}")
-            st.write(f"**País / ciudad:** {row['País']} / {row['Ciudad']}")
-            st.write(f"**Sector:** {row['Sector']}")
-            st.write(f"**Objetivo:** {row['Objetivo del proyecto']}")
-            st.write(f"**Mercados activos:** {row['Mercados activos']}")
-            st.write(f"**Canales:** {row['Canales de venta']}")
-            st.write(f"**Módulos:** {row['Módulos contratados']}")
-        with right:
-            cl_score = scorecard[scorecard["Cliente"] == client_name]
-            if not cl_score.empty:
-                dimensions = [c for c in cl_score.columns if c not in ["Cliente", "Score total", "Semáforo", "Observación"]]
-                values = cl_score.iloc[0][dimensions].astype(float).tolist()
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Scatterpolar(r=values + values[:1], theta=dimensions + dimensions[:1], fill="toself", name=client_name)
-                )
-                fig.update_layout(height=500, polar=dict(radialaxis=dict(visible=True, range=[0, 5])), showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
+    st.download_button("Descargar tabla clientes CSV", client_df.to_csv(index=False).encode("utf-8-sig"), file_name="clientes_filtrados.csv", mime="text/csv")
 
 elif page == "Finanzas":
     st.subheader("Motor financiero")
     c1, c2 = st.columns((1.15, 1))
     with c1:
-        fig = px.scatter(
-            finanzas,
-            x="Payback period (meses)",
-            y="ROI cartera (%)",
-            size="Mejora EBITDA (€)",
-            color="Cliente",
-            hover_name="Cliente",
-            title="Payback vs ROI",
-        )
+        fig = px.scatter(finanzas, x="Payback period (meses)", y="ROI cartera (%)", size="Mejora EBITDA (€)", color="Cliente", hover_name="Cliente", title="Payback vs ROI")
         fig.update_layout(height=450)
         st.plotly_chart(fig, use_container_width=True)
     with c2:
         summary = finanzas[["Cliente", "Facturación actual (€)", "EBITDA actual (€)", "Mejora EBITDA (€)", "ROI cartera (%)"]].copy()
         summary = summary.sort_values("Mejora EBITDA (€)", ascending=False)
         st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    left, right = st.columns(2)
-    with left:
-        if not finanzas.empty:
-            fig = px.bar(
-                finanzas.melt(id_vars="Cliente", value_vars=["Facturación actual (€)", "Facturación estimada post acciones (€)"], var_name="Escenario", value_name="Importe"),
-                x="Cliente",
-                y="Importe",
-                color="Escenario",
-                barmode="group",
-                title="Facturación actual vs estimada",
-                text_auto=".2s",
-            )
-            fig.update_layout(height=380)
-            st.plotly_chart(fig, use_container_width=True)
-    with right:
-        if not finanzas.empty:
-            fig = px.bar(
-                finanzas.melt(id_vars="Cliente", value_vars=["Margen EBITDA actual (%)", "Margen EBITDA estimado (%)"], var_name="Margen", value_name="Valor"),
-                x="Cliente",
-                y="Valor",
-                color="Margen",
-                barmode="group",
-                title="Margen EBITDA actual vs estimado",
-                text_auto=".1%",
-            )
-            fig.update_layout(height=380, yaxis_tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
 
 elif page == "Problemas y acciones":
     st.subheader("Backlog operativo")
@@ -416,17 +336,8 @@ elif page == "Problemas y acciones":
         modulo_prob = cols[2].multiselect("Módulo", sorted(problemas["Módulo"].dropna().astype(str).unique().tolist()), default=sorted(problemas["Módulo"].dropna().astype(str).unique().tolist()))
         responsable_prob = cols[3].multiselect("Responsable", sorted(problemas["Responsable asignado"].dropna().astype(str).unique().tolist()), default=sorted(problemas["Responsable asignado"].dropna().astype(str).unique().tolist()))
         prob_df = problemas.copy()
-        prob_df = prob_df[
-            prob_df["Urgencia"].isin(urgency)
-            & prob_df["Estado"].astype(str).isin(estado_prob)
-            & prob_df["Módulo"].astype(str).isin(modulo_prob)
-            & prob_df["Responsable asignado"].astype(str).isin(responsable_prob)
-        ]
+        prob_df = prob_df[prob_df["Urgencia"].isin(urgency) & prob_df["Estado"].astype(str).isin(estado_prob) & prob_df["Módulo"].astype(str).isin(modulo_prob) & prob_df["Responsable asignado"].astype(str).isin(responsable_prob)]
         st.dataframe(prob_df, use_container_width=True, hide_index=True)
-        if not prob_df.empty:
-            fig = px.bar(prob_df, x="Cliente", y="Impacto económico (€)", color="Urgencia", title="Impacto económico por problema", text_auto=".2s")
-            fig.update_layout(height=350)
-            st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
         cols = st.columns(4)
@@ -435,17 +346,8 @@ elif page == "Problemas y acciones":
         modulo_acc = cols[2].multiselect("Módulo relacionado", sorted(acciones["Módulo relacionado"].dropna().astype(str).unique().tolist()), default=sorted(acciones["Módulo relacionado"].dropna().astype(str).unique().tolist()))
         responsable_acc = cols[3].multiselect("Responsable", sorted(acciones["Responsable"].dropna().astype(str).unique().tolist()), default=sorted(acciones["Responsable"].dropna().astype(str).unique().tolist()))
         act_df = acciones.copy()
-        act_df = act_df[
-            act_df["Estado"].astype(str).isin(estado_acc)
-            & act_df["Categoría"].astype(str).isin(cat_acc)
-            & act_df["Módulo relacionado"].astype(str).isin(modulo_acc)
-            & act_df["Responsable"].astype(str).isin(responsable_acc)
-        ]
+        act_df = act_df[act_df["Estado"].astype(str).isin(estado_acc) & act_df["Categoría"].astype(str).isin(cat_acc) & act_df["Módulo relacionado"].astype(str).isin(modulo_acc) & act_df["Responsable"].astype(str).isin(responsable_acc)]
         st.dataframe(act_df, use_container_width=True, hide_index=True)
-        if not act_df.empty:
-            fig = px.bar(act_df.sort_values("Prioridad calculada", ascending=False), x="Descripción acción", y="Prioridad calculada", color="Estado", title="Prioridad calculada de acciones")
-            fig.update_layout(height=350, xaxis_title=None)
-            st.plotly_chart(fig, use_container_width=True)
 
 elif page == "Módulos":
     st.subheader("Sistema modular")
@@ -476,114 +378,6 @@ elif page == "Módulos":
                 fig = px.bar(activation, x="Cliente", y="Ahorro", color="Semáforo", title="Ahorro potencial del módulo", text_auto=".2s")
                 fig.update_layout(height=360)
                 st.plotly_chart(fig, use_container_width=True)
-
-elif page == "Informe por cliente":
-    if not selected_clients:
-        st.warning("No hay clientes visibles con los filtros actuales.")
-    else:
-        client_name = st.selectbox("Cliente para informe", selected_clients)
-        client_row = base[base["Marca/Nombre comercial"] == client_name].iloc[0]
-        score_row = scorecard[scorecard["Cliente"] == client_name].iloc[0] if not scorecard[scorecard["Cliente"] == client_name].empty else None
-        fin_row = finanzas[finanzas["Cliente"] == client_name].iloc[0] if not finanzas[finanzas["Cliente"] == client_name].empty else None
-        prob_client = problemas[problemas["Cliente"] == client_name]
-        acc_client = acciones[acciones["Cliente"] == client_name]
-        sup_row = supply[supply["Cliente"] == client_name].iloc[0] if not supply[supply["Cliente"] == client_name].empty else None
-        com_row = comercial[comercial["Cliente"] == client_name].iloc[0] if not comercial[comercial["Cliente"] == client_name].empty else None
-
-        top = st.columns(5)
-        top[0].metric("Estado", client_row["Estado proyecto"])
-        top[1].metric("Facturación", fmt_money(client_row["Facturación anual (€)"]))
-        top[2].metric("EBITDA", fmt_money(client_row["EBITDA (€)"]))
-        top[3].metric("Score operativo", f"{float(score_row['Score total']):.2f}" if score_row is not None else "—")
-        top[4].metric("Semáforo", score_row["Semáforo"] if score_row is not None else "—")
-
-        col_a, col_b = st.columns((1.1, 1))
-        with col_a:
-            st.markdown("### Resumen ejecutivo")
-            st.write(f"**Nombre legal:** {client_row['Nombre legal']}")
-            st.write(f"**Sector:** {client_row['Sector']} · **Tamaño:** {client_row['Tamaño empresa']}")
-            st.write(f"**País / ciudad:** {client_row['País']} / {client_row['Ciudad']}")
-            st.write(f"**Objetivo del proyecto:** {client_row['Objetivo del proyecto']}")
-            st.write(f"**Canales:** {client_row['Canales de venta']}")
-            st.write(f"**Mercados activos:** {client_row['Mercados activos']}")
-            st.write(f"**Módulos contratados:** {client_row['Módulos contratados']}")
-            st.write(f"**Notas internas:** {client_row['Notas internas']}")
-
-            if fin_row is not None:
-                st.markdown("### Palancas financieras")
-                fin_table = pd.DataFrame(
-                    {
-                        "Concepto": [
-                            "Ahorro identificado",
-                            "EBITDA estimado",
-                            "Mejora EBITDA",
-                            "Margen estimado",
-                            "Payback",
-                            "ROI cartera",
-                        ],
-                        "Valor": [
-                            fmt_money(fin_row["Ahorro identificado total (€)"]),
-                            fmt_money(fin_row["EBITDA estimado post acciones (€)"]),
-                            fmt_money(fin_row["Mejora EBITDA (€)"]),
-                            fmt_pct(fin_row["Margen EBITDA estimado (%)"]),
-                            f"{fin_row['Payback period (meses)']:.1f} meses",
-                            fmt_pct(fin_row["ROI cartera (%)"] / 100),
-                        ],
-                    }
-                )
-                st.dataframe(fin_table, use_container_width=True, hide_index=True)
-
-        with col_b:
-            if score_row is not None:
-                dimensions = [c for c in scorecard.columns if c not in ["Cliente", "Score total", "Semáforo", "Observación"]]
-                values = [float(score_row[d]) for d in dimensions]
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Scatterpolar(
-                        r=values + values[:1],
-                        theta=dimensions + dimensions[:1],
-                        fill="toself",
-                        marker_color=radar_color(score_row["Semáforo"]),
-                        name=client_name,
-                    )
-                )
-                fig.update_layout(height=560, polar=dict(radialaxis=dict(visible=True, range=[0, 5])), showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-
-        low_areas = []
-        if score_row is not None:
-            low_areas = [k for k in dimensions if float(score_row[k]) < 3]
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("### Áreas débiles")
-            if low_areas:
-                st.write(" · ".join(low_areas))
-            else:
-                st.success("No hay áreas críticas por debajo de 3.")
-        with c2:
-            st.markdown("### Supply chain")
-            if sup_row is not None:
-                st.write(f"**Estado general:** {sup_row['Estado general']}")
-                st.write(f"**Lead time promedio:** {sup_row['Lead time promedio (días)']} días")
-                st.write(f"**Oportunidad optimización:** {fmt_money(sup_row['Oportunidad de optimización (€)'])}")
-        with c3:
-            st.markdown("### Estructura comercial")
-            if com_row is not None:
-                st.write(f"**Mercados activos:** {com_row['Número de mercados activos']}")
-                st.write(f"**Margen comercial:** {fmt_pct(com_row['Margen comercial (%)'])}")
-                st.write(f"**Potencial crecimiento:** {fmt_money(com_row['Potencial de crecimiento identificado (€)'])}")
-
-        tab1, tab2 = st.tabs(["Problemas del cliente", "Acciones del cliente"])
-        with tab1:
-            st.dataframe(prob_client, use_container_width=True, hide_index=True)
-        with tab2:
-            st.dataframe(acc_client, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Descargar acciones CSV",
-                acc_client.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"acciones_{client_name}.csv",
-                mime="text/csv",
-            )
 
 elif page == "Explorador Excel":
     st.subheader("Explorador del workbook")
